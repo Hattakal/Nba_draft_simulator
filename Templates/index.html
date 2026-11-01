@@ -14,27 +14,53 @@
         <div class="flex flex-col md:flex-row justify-between items-center bg-slate-800 p-6 rounded-xl shadow-lg border border-slate-700">
             <div>
                 <h1 class="text-3xl font-extrabold text-indigo-400">🏀 NBA Fantasy Draft Engine</h1>
-                <p class="text-slate-400 text-sm mt-1">You are managing <strong class="text-white">Team 1</strong>. Draft wisely against the AI.</p>
+                <p class="text-slate-400 text-sm mt-1">You are managing <strong id="user-team-label" class="text-white">your team</strong>. Draft wisely against the AI.</p>
             </div>
-            <button id="run-draft-btn" onclick="startSimulation()" class="mt-4 md:mt-0 bg-indigo-600 hover:bg-indigo-500 text-white font-bold py-3 px-6 rounded-lg transition duration-200 shadow-md">
-                ⚡ Start Draft
-            </button>
+            <div class="flex items-center gap-3 mt-4 md:mt-0">
+                <label for="team-picker" class="text-sm text-slate-400">Team</label>
+                <select id="team-picker" class="bg-slate-900 border border-slate-600 text-slate-100 text-sm rounded-lg px-3 py-3 focus:outline-none focus:border-indigo-500">
+                    <option value="random">🎲 Random</option>
+                </select>
+                <label for="draft-slot" class="text-sm text-slate-400">Pick</label>
+                <select id="draft-slot" class="bg-slate-900 border border-slate-600 text-slate-100 text-sm rounded-lg px-3 py-3 focus:outline-none focus:border-indigo-500">
+                    <option value="random">🎲 Random</option>
+                </select>
+                <button id="run-draft-btn" onclick="startSimulation()" class="bg-indigo-600 hover:bg-indigo-500 text-white font-bold py-3 px-6 rounded-lg transition duration-200 shadow-md">
+                    ⚡ Start Draft
+                </button>
+            </div>
         </div>
 
         <div class="grid grid-cols-1 xl:grid-cols-4 gap-6">
 
-            <!-- Available Players Panel (New) -->
-            <div class="bg-slate-800 p-6 rounded-xl border border-slate-700 shadow-lg flex flex-col h-[750px]">
-                <h2 class="text-xl font-bold mb-4 text-slate-200 flex items-center justify-between">
+            <!-- Available Players Panel: widens on your turn to show your squad next to the pool -->
+            <div id="pool-panel" class="bg-slate-800 p-6 rounded-xl border border-slate-700 shadow-lg flex flex-col h-[750px] transition-all">
+                <h2 class="text-xl font-bold mb-3 text-slate-200 flex items-center justify-between">
                     <span>🎯 Available Pool</span>
+                    <span id="roster-slots" class="text-xs font-normal font-mono text-slate-400"></span>
                 </h2>
+                <div class="flex gap-4 flex-1 min-h-0">
+                <div class="flex flex-col flex-1 min-w-0">
+                <input id="player-search" type="search" oninput="renderAvailablePlayers()" placeholder="Search name or tag (e.g. rim protector)"
+                       class="w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-sm text-slate-100 placeholder-slate-500 focus:outline-none focus:border-indigo-500">
+                <div id="filter-chips" class="flex flex-wrap gap-1 mt-2"></div>
+                <div class="flex justify-between items-center text-[11px] text-slate-500 mt-2 mb-2">
+                    <span id="search-count"></span>
+                    <label class="flex items-center gap-1 cursor-pointer select-none">
+                        <input id="hide-full" type="checkbox" onchange="renderAvailablePlayers()" class="accent-indigo-500"> Hide full positions
+                    </label>
+                </div>
                 <div class="overflow-y-auto flex-1 pr-2 space-y-2" id="available-players-container">
                     <p class="text-center text-slate-500 py-8">Pool will load when draft starts.</p>
+                </div>
+                </div>
+                <div id="detail-panel" class="hidden w-[360px] shrink-0 overflow-y-auto bg-slate-900/60 rounded-lg border border-slate-700 p-4"></div>
+                <div id="squad-panel" class="hidden w-72 shrink-0 overflow-y-auto bg-slate-900/60 rounded-lg border border-slate-700 p-3"></div>
                 </div>
             </div>
 
             <!-- Draft Board -->
-            <div class="xl:col-span-2 bg-slate-800 p-6 rounded-xl border border-slate-700 shadow-lg flex flex-col h-[750px]">
+            <div id="board-panel" class="xl:col-span-2 bg-slate-800 p-6 rounded-xl border border-slate-700 shadow-lg flex flex-col h-[750px]">
                 <h2 class="text-xl font-bold mb-4 text-slate-200 flex items-center justify-between">
                     <span>📋 Live Draft Board</span>
                     <span class="text-xs text-slate-400 font-normal">Click player to view stats</span>
@@ -76,19 +102,165 @@
     <script>
         let isDrafting = false;
         let userTurn = false;
+        let userTeam = null;
+        let availablePlayers = [];
+        let myTeam = null;
+        let selectedName = null;  // player shown in the stats card on your turn
+        const POSITION_WEIGHTS = {{ position_weights|tojson }};
+        const PILLARS = [
+            ['scoring', 'Scoring'], ['playmaking', 'Playmaking'], ['defense', 'Defense'],
+            ['spacing', 'Spacing'], ['rebounding', 'Rebounding']
+        ];
+
+        const NBA_TEAMS = {{ nba_teams|tojson }};
+        const TEAM_META = Object.fromEntries(NBA_TEAMS.map(t => [t.name, t]));
+        const activeFilters = new Set();
+
+        const FILTER_CHIPS = ['G', 'F', 'C', 'Elite Scorer', 'Primary Playmaker', 'Elite Rebounder', 'Rim Protector', 'Lockdown Defender'];
+        const BAD_TAGS = ['Bad Defender', 'Non-Spacer'];
+        const SLOT_ORDER = ['G', 'G', 'F', 'F', 'C'];
+        const MEH_TAGS = ['Low Spacer'];
+
+        // Fill the team and draft slot dropdowns
+        (function setupPickers() {
+            const sel = document.getElementById('draft-slot');
+            for (let i = 1; i <= 30; i++) sel.insertAdjacentHTML('beforeend', `<option value="${i}">#${i}</option>`);
+            const teamSel = document.getElementById('team-picker');
+            NBA_TEAMS.forEach(t => teamSel.insertAdjacentHTML('beforeend', `<option value="${t.name}">${t.name}</option>`));
+            renderFilterChips();
+        })();
+
+        // Team name, or its abbreviation when short=true
+        function teamBadge(name, short = false) {
+            const t = TEAM_META[name];
+            return t && short ? t.abbr : name;
+        }
+
+        // Your turn: the pool panel takes over the draft board's space and shows
+        // a stats card and your squad next to the player list
+        function setWideMode(on) {
+            document.getElementById('pool-panel').classList.toggle('xl:col-span-3', on);
+            document.getElementById('board-panel').classList.toggle('hidden', on);
+            document.getElementById('detail-panel').classList.toggle('hidden', !on);
+            document.getElementById('squad-panel').classList.toggle('hidden', !on);
+            if (!on) selectedName = null;
+        }
+
+        function selectPlayer(name) {
+            selectedName = name;
+            renderAvailablePlayers();
+        }
+
+        function renderDetail(shownPlayers) {
+            const panel = document.getElementById('detail-panel');
+            if (!userTurn) return;
+            let p = availablePlayers.find(x => x.name === selectedName);
+            if (!p) p = shownPlayers.find(x => x.slot_open) || shownPlayers[0];
+            if (!p) { panel.innerHTML = '<p class="text-slate-500 text-sm">No player selected.</p>'; return; }
+            selectedName = p.name;
+
+            const w = POSITION_WEIGHTS[p.position] || POSITION_WEIGHTS['F'];
+            const safeName = p.name.replace(/'/g, "\\'");
+            const signed = v => `${v > 0 ? '+' : ''}${v}`;
+
+            panel.innerHTML = `
+                <div class="flex items-start justify-between gap-2">
+                    <div class="min-w-0">
+                        <div class="text-lg font-extrabold text-white leading-tight">${p.name}</div>
+                        <div class="text-xs text-slate-400 mt-1 flex items-center gap-2">
+                            <span class="text-[10px] px-1.5 py-0.5 rounded font-bold ${getPosColor(p.position)}">${p.position}</span>
+                            ${p.age ? `Age ${Math.round(p.age)} · ` : ''}${p.games ? `${Math.round(p.games)} G · ` : ''}${p.mpg} MPG
+                        </div>
+                    </div>
+                    <div class="text-right shrink-0">
+                        <div class="text-3xl font-extrabold text-indigo-300 font-mono leading-none">${p.overall_rank}</div>
+                        <div class="text-[10px] text-slate-500 uppercase mt-1">Overall</div>
+                    </div>
+                </div>
+
+                <div class="text-[10px] text-slate-500 font-mono mt-3 bg-slate-950 rounded px-2 py-1.5">
+                    Base ${p.base_score} × ${Number(p.vol_multiplier).toFixed(2)} minutes × ${Number(p.on_off_multiplier).toFixed(2)} on/off (${signed(p.on_off_raw)})
+                </div>
+
+                <div class="mt-4 space-y-2">
+                    ${PILLARS.map(([key, label]) => {
+                        const val = Number(p['std_' + key]);
+                        const pct = Math.min(val / 130 * 100, 100);
+                        return `
+                        <div>
+                            <div class="flex justify-between text-[11px]">
+                                <span class="text-slate-300">${label} <span class="text-slate-500">(${Math.round(w[key] * 100)}%)</span></span>
+                                <span class="font-mono"><span class="text-white font-bold">${Math.round(val)}</span>
+                                    <span class="text-indigo-400">+${(val * w[key]).toFixed(1)}</span></span>
+                            </div>
+                            <div class="h-1.5 bg-slate-800 rounded mt-0.5 overflow-hidden">
+                                <div class="h-full rounded ${val >= 80 ? 'bg-emerald-500' : val >= 60 ? 'bg-indigo-500' : val <= 25 ? 'bg-red-500' : 'bg-slate-500'}" style="width:${pct}%"></div>
+                            </div>
+                        </div>`;
+                    }).join('')}
+                </div>
+
+                ${p.tags.length ? `<div class="flex flex-wrap gap-1 mt-4">${p.tags.map(t =>
+                    `<span class="text-[10px] px-1.5 py-0.5 rounded border ${tagClass(t)}">${t}</span>`).join('')}</div>` : ''}
+
+                <div class="mt-4 border-t border-slate-700 pt-3">
+                    ${p.slot_open ? `
+                        <div class="flex justify-between items-baseline mb-2">
+                            <span class="text-[10px] font-bold uppercase tracking-wider text-slate-400">Fit with your squad</span>
+                            <span class="font-mono font-bold ${p.synergy_gain > 0 ? 'text-emerald-400' : p.synergy_gain < 0 ? 'text-red-400' : 'text-slate-400'}">${signed(p.synergy_gain)} syn</span>
+                        </div>
+                        <div class="space-y-1">
+                            ${p.synergy_changes.length ? p.synergy_changes.map(c => `
+                                <div class="flex justify-between text-[11px] px-2 py-0.5 rounded ${c.pts > 0 ? 'bg-emerald-950/40 text-emerald-300' : 'bg-red-950/40 text-red-300'}">
+                                    <span>${c.lost ? '<span class="line-through opacity-70">' + c.rule + '</span>' : c.rule}</span>
+                                    <span class="font-mono">${signed(c.pts)}</span>
+                                </div>`).join('') : '<div class="text-[11px] text-slate-500">No change to your synergy.</div>'}
+                        </div>
+                        <button onclick="draftUserPlayer('${safeName}')" class="w-full mt-4 bg-emerald-600 hover:bg-emerald-500 text-white font-bold py-2 rounded-lg transition">Draft ${p.name}</button>
+                    ` : `<div class="text-sm text-slate-400 text-center py-2">Your ${p.position} spots are full.</div>`}
+                </div>
+            `;
+        }
+
+        function setPickersDisabled(disabled) {
+            document.getElementById('draft-slot').disabled = disabled;
+            document.getElementById('team-picker').disabled = disabled;
+        }
+
+        function renderFilterChips() {
+            document.getElementById('filter-chips').innerHTML = FILTER_CHIPS.map(f => `
+                <button onclick="toggleFilter('${f}')" class="text-[10px] px-2 py-0.5 rounded-full border transition ${activeFilters.has(f)
+                    ? 'bg-indigo-600 border-indigo-400 text-white' : 'border-slate-600 text-slate-400 hover:border-slate-400'}">${f}</button>
+            `).join('');
+        }
+
+        function toggleFilter(f) {
+            activeFilters.has(f) ? activeFilters.delete(f) : activeFilters.add(f);
+            renderFilterChips();
+            renderAvailablePlayers();
+        }
 
         async function startSimulation() {
             const btn = document.getElementById('run-draft-btn');
+            const slotPicker = document.getElementById('draft-slot');
             btn.innerText = "🔄 Initializing...";
             btn.disabled = true;
-            btn.classList.remove('bg-red-600', 'hover:bg-red-500', 'animate-pulse');
+            setPickersDisabled(true);
+            setWideMode(false);
+            btn.classList.remove('bg-red-600', 'hover:bg-red-500', 'animate-pulse', 'bg-emerald-600');
             btn.classList.add('bg-indigo-600', 'hover:bg-indigo-500');
 
             try {
-                const response = await fetch('/api/init-draft', { method: 'POST' });
+                const response = await fetch('/api/init-draft', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ draft_slot: slotPicker.value, team: document.getElementById('team-picker').value })
+                });
                 const data = await response.json();
 
                 if (data.status === "success") {
+                    userTeam = data.user_team;
+                    document.getElementById('user-team-label').innerHTML = `${teamBadge(data.user_team)} <span class="text-slate-400 font-normal">(pick #${data.draft_slot})</span>`;
                     isDrafting = true;
                     userTurn = false;
                     document.getElementById('draft-board-body').innerHTML = "";
@@ -98,11 +270,13 @@
                     alert("Error: " + data.message);
                     btn.innerText = "⚡ Start Draft";
                     btn.disabled = false;
+                    setPickersDisabled(false);
                 }
             } catch (err) {
                 alert("Network Error");
                 btn.innerText = "⚡ Start Draft";
                 btn.disabled = false;
+                setPickersDisabled(false);
             }
         }
 
@@ -119,20 +293,24 @@
 
                 if (data.status === "complete") {
                     isDrafting = false;
-                    btn.innerText = "✅ Draft Complete";
+                    btn.innerText = "✅ Draft Complete · 🔁 New Draft";
                     btn.classList.remove('bg-indigo-600', 'hover:bg-indigo-500', 'bg-red-600', 'hover:bg-red-500', 'animate-pulse');
                     btn.classList.add('bg-emerald-600');
+                    btn.disabled = false;
+                    setPickersDisabled(false);
                     return;
                 }
 
                 if (data.status === "user_turn") {
                     userTurn = true;
+
+                    // Widen the pool panel and re-render it with Draft buttons and your squad,
+                    // then announce the turn once everything is clickable
+                    setWideMode(true);
+                    await updateDashboards();
                     btn.innerText = "🚨 YOUR TURN";
                     btn.classList.remove('bg-indigo-600', 'hover:bg-indigo-500');
                     btn.classList.add('bg-red-600', 'hover:bg-red-500', 'animate-pulse');
-
-                    // Re-render available players to show the "Draft" buttons
-                    await updateDashboards();
                     return; // Pause the loop here. It restarts when draftUserPlayer() is called.
                 }
 
@@ -162,13 +340,25 @@
             btn.classList.add('bg-indigo-600', 'hover:bg-indigo-500');
 
             userTurn = false;
+            setWideMode(false);
 
             try {
-                await fetch('/api/make-user-pick', {
+                const res = await fetch('/api/make-user-pick', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ player_name: playerName })
                 });
+                if (!res.ok) {
+                    const err = await res.json();
+                    alert(err.message || "That pick isn't allowed.");
+                    userTurn = true;
+                    setWideMode(true);
+                    btn.innerText = "🚨 YOUR TURN";
+                    btn.classList.remove('bg-indigo-600', 'hover:bg-indigo-500');
+                    btn.classList.add('bg-red-600', 'hover:bg-red-500', 'animate-pulse');
+                    renderAvailablePlayers();
+                    return;
+                }
 
                 await updateDashboards();
 
@@ -182,22 +372,118 @@
         }
 
         async function loadAvailablePlayers() {
-            const res = await fetch('/api/available-players');
-            const players = await res.json();
+            const [poolRes, teamRes] = await Promise.all([fetch('/api/available-players'), fetch('/api/my-team')]);
+            availablePlayers = await poolRes.json();
+            myTeam = await teamRes.json();
 
+            document.getElementById('roster-slots').innerHTML = ['G', 'F', 'C'].map(pos => {
+                const full = myTeam.filled[pos] >= myTeam.slots[pos];
+                return `<span class="${full ? 'text-slate-600 line-through' : 'text-slate-300'}">${pos} ${myTeam.filled[pos]}/${myTeam.slots[pos]}</span>`;
+            }).join(' · ');
+
+            renderAvailablePlayers();
+            renderSquad();
+        }
+
+        function renderSquad() {
+            if (!myTeam) return;
+            const remaining = [...myTeam.roster];
+            const slots = SLOT_ORDER.map(pos => {
+                const i = remaining.findIndex(p => p.position === pos);
+                return { pos, player: i >= 0 ? remaining.splice(i, 1)[0] : null };
+            });
+
+            document.getElementById('squad-panel').innerHTML = `
+                <div class="text-sm font-bold text-slate-200 mb-1">${teamBadge(myTeam.team)}</div>
+                <div class="text-[11px] text-slate-400 mb-3">
+                    Talent <span class="font-mono text-slate-200">${myTeam.talent}</span> ·
+                    Synergy <span class="font-mono ${myTeam.synergy >= 0 ? 'text-emerald-400' : 'text-red-400'}">${myTeam.synergy >= 0 ? '+' : ''}${myTeam.synergy}</span>
+                </div>
+                <div class="space-y-1.5 mb-4">
+                    ${slots.map(s => s.player ? `
+                        <div class="bg-slate-800 border border-slate-700 rounded px-2 py-1.5">
+                            <div class="flex items-center justify-between gap-2 text-xs">
+                                <span class="flex items-center gap-1.5 min-w-0">
+                                    <span class="text-[10px] px-1.5 py-0.5 rounded font-bold ${getPosColor(s.pos)}">${s.pos}</span>
+                                    <span class="font-bold text-white truncate">${s.player.name}</span>
+                                </span>
+                                <span class="font-mono text-indigo-300 font-bold">${s.player.overall_rank}</span>
+                            </div>
+                            ${s.player.tags.length ? `<div class="flex flex-wrap gap-1 mt-1">${s.player.tags.map(t =>
+                                `<span class="text-[9px] px-1.5 py-px rounded border ${tagClass(t)}">${t}</span>`).join('')}</div>` : ''}
+                        </div>` : `
+                        <div class="border border-dashed border-slate-600 rounded px-2 py-2 text-xs text-slate-500 flex items-center gap-1.5">
+                            <span class="text-[10px] px-1.5 py-0.5 rounded font-bold ${getPosColor(s.pos)}">${s.pos}</span> Open slot
+                        </div>`).join('')}
+                </div>
+                ${myTeam.synergy_breakdown.length ? `
+                    <div class="text-[10px] font-bold uppercase tracking-wider text-slate-400 mb-1">Synergy so far</div>
+                    <div class="space-y-1">
+                        ${myTeam.synergy_breakdown.map(b => `
+                            <div class="flex justify-between text-[11px] px-2 py-0.5 rounded ${b.pts > 0 ? 'bg-emerald-950/40 text-emerald-300' : 'bg-red-950/40 text-red-300'}">
+                                <span>${b.rule}</span><span class="font-mono">${b.pts > 0 ? '+' : ''}${b.pts}</span>
+                            </div>`).join('')}
+                    </div>` : ''}
+            `;
+        }
+
+        function matchesSearch(p) {
+            const q = document.getElementById('player-search').value.trim().toLowerCase();
+            if (document.getElementById('hide-full').checked && !p.slot_open) return false;
+            for (const f of activeFilters) {
+                if (['G', 'F', 'C'].includes(f) ? p.position !== f : !p.tags.includes(f)) return false;
+            }
+            if (!q) return true;
+            return p.name.toLowerCase().includes(q) || p.tags.some(t => t.toLowerCase().includes(q));
+        }
+
+        function tagClass(tag) {
+            if (BAD_TAGS.includes(tag)) return 'bg-red-950/50 text-red-300 border-red-800/60';
+            if (MEH_TAGS.includes(tag)) return 'bg-amber-950/40 text-amber-300 border-amber-800/50';
+            return 'bg-emerald-950/40 text-emerald-300 border-emerald-800/50';
+        }
+
+        function renderAvailablePlayers() {
             const container = document.getElementById('available-players-container');
-            container.innerHTML = players.map(p => `
-                <div class="bg-slate-900 p-3 rounded-lg border border-slate-700 flex justify-between items-center">
-                    <div>
-                        <div class="font-bold text-slate-200 text-sm">${p.name}</div>
-                        <div class="flex items-center gap-2 mt-1">
+            const matches = availablePlayers.filter(matchesSearch);
+            const shown = matches.slice(0, 50);
+
+            document.getElementById('search-count').innerText = availablePlayers.length
+                ? `Showing ${shown.length} of ${matches.length}` : '';
+
+            if (!availablePlayers.length) return;
+            renderDetail(shown);
+            if (!shown.length) {
+                container.innerHTML = '<p class="text-center text-slate-500 py-8 text-sm">No players match.</p>';
+                return;
+            }
+
+            container.innerHTML = shown.map(p => {
+                const safeName = p.name.replace(/'/g, "\\'");
+                let action;
+                if (!userTurn) action = `<span class="text-slate-600 text-xs">Waiting...</span>`;
+                else if (!p.slot_open) action = `<span class="text-slate-500 text-[10px] text-center leading-tight">${p.position}<br>full</span>`;
+                else action = `<button onclick="event.stopPropagation(); draftUserPlayer('${safeName}')" class="bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold px-3 py-1.5 rounded transition">Draft</button>`;
+
+                return `
+                <div ${userTurn ? `onclick="selectPlayer('${safeName}')"` : ''} class="bg-slate-900 p-3 rounded-lg border flex justify-between items-center gap-2 ${userTurn ? 'cursor-pointer hover:border-slate-500' : ''} ${userTurn && p.name === selectedName ? 'border-indigo-400 ring-1 ring-indigo-400/50' : 'border-slate-700'} ${p.slot_open ? '' : 'opacity-50'}">
+                    <div class="min-w-0">
+                        <div class="flex items-center gap-2">
+                            <span class="font-bold text-slate-200 text-sm truncate">${p.name}</span>
                             <span class="text-[10px] px-1.5 py-0.5 rounded font-bold ${getPosColor(p.position)}">${p.position}</span>
                             <span class="text-xs text-indigo-300 font-mono font-bold">${Number(p.overall_rank).toFixed(1)}</span>
+                            ${userTurn && p.synergy_gain !== null ? `<span title="Change to your roster's synergy" class="text-[10px] font-mono font-bold px-1.5 py-0.5 rounded ${p.synergy_gain > 0
+                                ? 'bg-emerald-900/50 text-emerald-300' : p.synergy_gain < 0 ? 'bg-red-900/50 text-red-300' : 'bg-slate-800 text-slate-400'}">${p.synergy_gain > 0 ? '+' : ''}${p.synergy_gain} syn</span>` : ''}
                         </div>
+                        <div class="text-[10px] font-mono text-slate-500 mt-1">
+                            SCR ${Math.round(p.std_scoring)} · PLY ${Math.round(p.std_playmaking)} · DEF ${Math.round(p.std_defense)} · SPC ${Math.round(p.std_spacing)} · REB ${Math.round(p.std_rebounding)}
+                        </div>
+                        ${p.tags.length ? `<div class="flex flex-wrap gap-1 mt-1">${p.tags.map(t =>
+                            `<span class="text-[9px] px-1.5 py-px rounded border ${tagClass(t)}">${t}</span>`).join('')}</div>` : ''}
                     </div>
-                    ${userTurn ? `<button onclick="draftUserPlayer('${p.name.replace(/'/g, "\\'")}')" class="bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold px-3 py-1.5 rounded transition">Draft</button>` : `<span class="text-slate-600 text-xs">Waiting...</span>`}
-                </div>
-            `).join('');
+                    <div class="shrink-0">${action}</div>
+                </div>`;
+            }).join('');
         }
 
         async function loadDraftBoard() {
@@ -206,13 +492,9 @@
 
             const tbody = document.getElementById('draft-board-body');
             tbody.innerHTML = picks.map((p, idx) => {
-                let w_scoring = 0.25, w_play = 0.25, w_def = 0.25, w_space = 0.10, w_reb = 0.15;
-
-                if (p.Position.includes('G')) {
-                    w_scoring = 0.30; w_play = 0.25; w_def = 0.20; w_space = 0.10; w_reb = 0.15;
-                } else if (p.Position.includes('C')) {
-                    w_scoring = 0.20; w_play = 0.20; w_def = 0.30; w_space = 0.15; w_reb = 0.15;
-                }
+                const pw = POSITION_WEIGHTS[p.Position] || POSITION_WEIGHTS['F'];
+                const w_scoring = pw.scoring, w_play = pw.playmaking, w_def = pw.defense,
+                      w_space = pw.spacing, w_reb = pw.rebounding;
 
                 const ptsScoring = (p.std_scoring * w_scoring).toFixed(1);
                 const ptsPlaymaking = (p.std_playmaking * w_play).toFixed(1);
@@ -223,7 +505,7 @@
                 return `
                     <tr onclick="toggleDetails('player-${idx}')" class="hover:bg-indigo-950/40 cursor-pointer transition border-b border-slate-700/30">
                         <td class="p-3 font-mono text-indigo-400">#${p.Pick}</td>
-                        <td class="p-3 font-semibold ${p.Team === 'Team 1' ? 'text-emerald-400' : 'text-slate-300'}">${p.Team}</td>
+                        <td class="p-3 font-semibold ${p.Team === userTeam ? 'text-emerald-400' : 'text-slate-300'}" title="${p.Team}">${teamBadge(p.Team, true)}</td>
                         <td class="p-3 font-bold text-white flex items-center gap-2">
                             ${p.Player}
                             <span class="text-slate-500 text-xs">▼</span>
@@ -239,7 +521,7 @@
                                         <span class="text-xs uppercase font-extrabold text-indigo-400">Scouting Profile (${p.Position})</span>
                                         <span class="text-[10px] text-slate-500 font-mono whitespace-nowrap">Base: ${p.base_score} × ${(p.vol_multiplier).toFixed(2)} Vol × ${(p.on_off_mult).toFixed(2)} On/Off</span>
                                     </div>
-                                    ${p.rim_protector ? '<span class="text-xs bg-red-900/50 text-red-300 border border-red-700 px-2 py-0.5 rounded font-bold whitespace-nowrap">🛡️ Rim Protector</span>' : ''}
+                                    ${p.rim_protector ? '<span class="text-xs bg-emerald-900/50 text-emerald-300 border border-emerald-700 px-2 py-0.5 rounded font-bold whitespace-nowrap">🛡️ Rim Protector</span>' : ''}
                                 </div>
                                 <div class="grid grid-cols-5 gap-2 text-center">
                                     <div class="bg-slate-900 p-2 rounded border border-slate-800">
@@ -285,12 +567,12 @@
                     <div onclick="toggleDetails('team-${idx}')" class="p-4 cursor-pointer hover:bg-slate-700/60 transition flex justify-between items-center">
                         <div>
                             <div class="flex items-center gap-2">
-                                <span class="font-bold ${t.team === 'Team 1' ? 'text-emerald-400' : 'text-slate-200'}">#${idx + 1} ${t.team}</span>
+                                <span class="font-bold flex items-center gap-1.5 ${t.is_user ? 'text-emerald-400' : 'text-slate-200'}">#${idx + 1} ${teamBadge(t.team)}</span>
                                 <span class="text-slate-500 text-xs">▼</span>
                             </div>
                             <div class="text-xs text-slate-400 mt-1">
-                                Talent: <span class="text-slate-200 font-mono">${t.avg_talent}</span> |
-                                Synergy: <span class="${t.synergy >= 0 ? 'text-emerald-400' : 'text-red-400'} font-mono">${t.synergy >= 0 ? '+' : ''}${t.synergy}</span>
+                                Talent: <span class="text-slate-200 font-mono">${t.talent}</span> <span class="text-slate-500">(avg ${t.avg_talent})</span> |
+                                Synergy: <span class="${t.synergy >= 0 ? 'text-emerald-400' : 'text-red-400'} font-mono">${t.weighted_synergy >= 0 ? '+' : ''}${t.weighted_synergy}</span>${t.synergy_weight !== 1 ? ` <span class="text-slate-500">(${t.synergy} × ${t.synergy_weight})</span>` : ''}
                             </div>
                         </div>
                         <span class="text-sm font-extrabold bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 px-3 py-1 rounded-full">

@@ -1,5 +1,31 @@
+import re
+import unicodedata
+
 import pandas as pd
 import numpy as np
+
+
+# Players whose first name differs between sources (normalized key -> normalized key)
+NAME_ALIASES = {
+    'ron holland': 'ronald holland',
+}
+
+NAME_SUFFIXES = {'jr', 'sr', 'ii', 'iii', 'iv', 'v'}
+
+# The Nth best player in each pillar is scaled to 100 (see process_and_standardize_profiles)
+ANCHOR_RANK = 10
+
+
+def name_key(name):
+    """Normalizes a player name so different sources match.
+    'Nikola Jokić' -> 'nikola jokic', 'A.J. Green' -> 'aj green', 'Jimmy Butler III' -> 'jimmy butler'
+    """
+    text = str(name).replace('ё', 'e').replace('Ё', 'E')  # Cyrillic ё doesn't decompose like Latin accents
+    text = unicodedata.normalize('NFKD', text).encode('ascii', 'ignore').decode('ascii')
+    text = re.sub(r"[^a-z0-9 ]", "", text.lower())
+    words = [w for w in text.split() if w not in NAME_SUFFIXES]
+    key = " ".join(words)
+    return NAME_ALIASES.get(key, key)
 
 
 # =====================================================================
@@ -9,7 +35,7 @@ import numpy as np
 def compute_raw_spacing(row):
     """Calculates spacing based on 3-point volume, accuracy, and depth."""
     fg3a_100 = float(row.get('3PA_100', 0.0))
-    fg3_pct = float(row.get('3P%', 0.0))
+    fg3_pct = float(row.get('3P%_100', 0.0))
     return fg3a_100 * (1.0 + fg3_pct)
 
 
@@ -23,7 +49,7 @@ def compute_raw_rebounding(row):
 def compute_raw_scoring(row):
     """Calculates raw scoring output using Per 100 Points and True Shooting efficiency."""
     pts = float(row.get('PTS_100', 0.0))
-    ts_pct = float(row.get('TS%', 0.0))
+    ts_pct = float(row.get('TS%_adv', 0.0))
     return pts * (ts_pct / 0.55 if ts_pct > 0 else 1.0)
 
 
@@ -62,8 +88,17 @@ def process_and_standardize_profiles():
             'D-LEBRON Value': 'D-LEBRON'
         })
 
-        df = df.merge(df_lebron[['name', 'D-LEBRON']], on='name', how='left')
+        # Match on a normalized name key so accents, capitalization and
+        # punctuation differences ("Jokić" vs "Jokic", "A.J." vs "Aj") don't break the merge
+        df['_key'] = df['name'].apply(name_key)
+        df_lebron['_key'] = df_lebron['name'].apply(name_key)
+        df_lebron = df_lebron.drop_duplicates(subset=['_key'], keep='first')
+        df = df.merge(df_lebron[['_key', 'D-LEBRON']], on='_key', how='left').drop(columns=['_key'])
+
+        unmatched = df.loc[df['D-LEBRON'].isna() & (df.get('MP', 0) >= 500), 'name'].tolist()
         print("✅ Successfully merged D-LEBRON metrics.")
+        if unmatched:
+            print(f"⚠️ {len(unmatched)} qualified players had no D-LEBRON match (set to 0.0): {unmatched}")
     except FileNotFoundError:
         print(f"⚠️ Warning: '{lebron_file}' not found. Defaulting missing D-LEBRON to 0.0 (League Avg).")
         df['D-LEBRON'] = 0.0
@@ -98,19 +133,21 @@ def process_and_standardize_profiles():
 
     standardized_columns = {}
 
-    # Standard metrics (Ratio to Max)
+    # Scale each pillar so the ANCHOR_RANK-th best player = 100.
+    # Anchoring on the 10th best instead of #1 stops one outlier (e.g. Wembanyama on defense)
+    # from squashing everyone else. Players above the anchor score over 100.
     for metric in ['scoring', 'spacing', 'playmaking', 'rebounding']:
         raw_col = f"raw_{metric}"
-        std_col = f"std_{metric}"
-        max_val = df[raw_col].max()
-        standardized_columns[std_col] = (df[raw_col] / max_val) * 100.0 if max_val > 0 else 0.0
+        anchor = df[raw_col].nlargest(ANCHOR_RANK).iloc[-1]
+        standardized_columns[f"std_{metric}"] = (df[raw_col] / anchor) * 100.0 if anchor > 0 else 0.0
 
-    # DEFENSE STANDARDIZATION (Min-Max Scaling for negative values)
-    min_def = df['raw_defense'].min()
-    max_def = df['raw_defense'].max()
-
-    if max_def > min_def:
-        standardized_columns['std_defense'] = ((df['raw_defense'] - min_def) / (max_def - min_def)) * 100.0
+    # DEFENSE: D-LEBRON can be negative, so anchor both ends:
+    # ANCHOR_RANK-th best = 100, ANCHOR_RANK-th worst = 0 (anything below is floored at 0)
+    def_high = df['raw_defense'].nlargest(ANCHOR_RANK).iloc[-1]
+    def_low = df['raw_defense'].nsmallest(ANCHOR_RANK).iloc[-1]
+    if def_high > def_low:
+        std_def = (df['raw_defense'] - def_low) / (def_high - def_low) * 100.0
+        standardized_columns['std_defense'] = std_def.clip(lower=0.0)
     else:
         standardized_columns['std_defense'] = 50.0
 
@@ -118,7 +155,7 @@ def process_and_standardize_profiles():
     df = pd.concat([df, pd.DataFrame(standardized_columns, index=df.index)], axis=1)
 
     # Save final CSV
-    metadata_candidates = ['name', 'position', 'Age', 'Tm', 'tm', 'team', 'G', 'MP', 'VORP_adv', 'On-Off_pbp']
+    metadata_candidates = ['name', 'position', 'Age', 'Team', 'Tm', 'tm', 'team', 'G', 'MP', 'VORP_adv', 'On-Off_pbp']
     existing_metadata = [col for col in metadata_candidates if col in df.columns]
 
     final_cols = existing_metadata + [

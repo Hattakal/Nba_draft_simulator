@@ -1,3 +1,5 @@
+import random
+
 from flask import Flask, jsonify, render_template, request
 import pandas as pd
 
@@ -6,10 +8,19 @@ from draft_engine import (
     calculate_overall_rank,
     calculate_roster_synergy,
     setup_draft_state,
-    execute_single_ai_pick
+    execute_single_ai_pick,
+    open_positions,
+    player_tags,
+    synergy_changes,
+    ROSTER_SLOTS,
+    POSITION_WEIGHTS
 )
+from nba_teams import NBA_TEAMS, TEAM_NAMES
 
-app = Flask(__name__)
+app = Flask(__name__, template_folder='Templates')  # folder name is capitalized; Linux servers are case-sensitive
+
+# How much roster synergy counts in the final team score, relative to total talent.
+SYNERGY_WEIGHT = 1.0
 
 # Global storage for active simulation state, now tracking the available pool
 DRAFT_STATE = {
@@ -19,20 +30,42 @@ DRAFT_STATE = {
     "available_players": [],
     "draft_order": [],
     "current_pick_index": 0,
-    "user_team": "Team 1"  # You will draft for Team 1
+    "user_team": None  # Set when the draft starts, from the chosen team
 }
 
 
 @app.route('/')
 def home():
     """Serves the main website interface."""
-    return render_template('index.html')
+    return render_template('index.html', nba_teams=NBA_TEAMS, position_weights=POSITION_WEIGHTS)
 
 
 @app.route('/api/init-draft', methods=['POST'])
 def init_draft():
-    """Loads the database and sets up the draft state without simulating all picks."""
+    """Loads the database and sets up the draft state without simulating all picks.
+    Accepts {"draft_slot": 1-30 or "random", "team": an NBA team name or "random"}.
+    The other 29 teams are shuffled into the remaining draft spots.
+    """
     try:
+        data = request.get_json(silent=True) or {}
+        slot = data.get('draft_slot', 'random')
+        if slot == 'random':
+            slot = random.randint(1, 30)
+        slot = int(slot)
+        if not 1 <= slot <= 30:
+            return jsonify({"status": "error", "message": "Draft slot must be between 1 and 30"}), 400
+
+        user_team = data.get('team', 'random')
+        if user_team == 'random':
+            user_team = random.choice(TEAM_NAMES)
+        if user_team not in TEAM_NAMES:
+            return jsonify({"status": "error", "message": f"Unknown team: {user_team}"}), 400
+
+        # Shuffle the AI teams, then put the user's team in the chosen spot
+        team_order = [t for t in TEAM_NAMES if t != user_team]
+        random.shuffle(team_order)
+        team_order.insert(slot - 1, user_team)
+
         df = pd.read_csv("nba_standardized_profiles_2026.csv")
         df = calculate_overall_rank(df)
 
@@ -42,8 +75,8 @@ def init_draft():
             position_map = {'PG': 'G', 'SG': 'G', 'SF': 'F', 'PF': 'F', 'C': 'C', 'G': 'G', 'F': 'F'}
             df['position'] = df['position'].map(position_map).fillna('F')
 
-        # NEW: Initialize the draft board, but do not make any picks yet
-        teams, available_players, draft_order = setup_draft_state(df)
+        # Initialize the draft board, but do not make any picks yet
+        teams, available_players, draft_order = setup_draft_state(df, team_order)
 
         DRAFT_STATE["df"] = df
         DRAFT_STATE["teams"] = teams
@@ -51,8 +84,10 @@ def init_draft():
         DRAFT_STATE["available_players"] = available_players
         DRAFT_STATE["draft_order"] = draft_order
         DRAFT_STATE["current_pick_index"] = 0
+        DRAFT_STATE["user_team"] = user_team
 
-        return jsonify({"status": "success", "message": "Draft initialized. Ready to start."})
+        return jsonify({"status": "success", "message": "Draft initialized. Ready to start.",
+                        "user_team": user_team, "draft_slot": slot, "team_order": team_order})
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
@@ -70,13 +105,15 @@ def make_ai_pick():
         return jsonify({"status": "user_turn", "team": current_team})
 
     # Let the AI make a pick
-    execute_single_ai_pick(
+    picked = execute_single_ai_pick(
         DRAFT_STATE["teams"],
         DRAFT_STATE["available_players"],
         DRAFT_STATE["draft_order"],
         DRAFT_STATE["current_pick_index"],
         DRAFT_STATE["draft_board"]
     )
+    if not picked:
+        return jsonify({"status": "error", "message": f"{current_team} has no legal player left"}), 500
 
     DRAFT_STATE["current_pick_index"] += 1
 
@@ -85,8 +122,57 @@ def make_ai_pick():
 
 @app.route('/api/available-players', methods=['GET'])
 def get_available_players():
-    """Returns the top 50 available players to keep the UI lightweight."""
-    return jsonify(DRAFT_STATE["available_players"][:50])
+    """Returns the whole available pool (sorted best first) so the UI can search it.
+    Each player gets their synergy tags and whether your roster still has room for them."""
+    user_roster = DRAFT_STATE["teams"].get(DRAFT_STATE["user_team"], [])
+    open_slots = open_positions(user_roster)
+    current_synergy = calculate_roster_synergy(user_roster)
+    players = []
+    for p in DRAFT_STATE["available_players"]:
+        slot_open = p['position'] in open_slots
+        # How much this player would change YOUR roster's synergy (only for legal picks)
+        synergy_gain = round(calculate_roster_synergy(user_roster + [p]) - current_synergy, 1) if slot_open else None
+        changes = synergy_changes(user_roster, p) if slot_open else []
+        players.append({
+            "name": p['name'],
+            "position": p['position'],
+            "overall_rank": round(p['overall_rank'], 1),
+            "std_scoring": p.get('std_scoring', 0),
+            "std_playmaking": p.get('std_playmaking', 0),
+            "std_defense": p.get('std_defense', 0),
+            "std_spacing": p.get('std_spacing', 0),
+            "std_rebounding": p.get('std_rebounding', 0),
+            "tags": player_tags(p),
+            "slot_open": slot_open,
+            "synergy_gain": synergy_gain,
+            "synergy_changes": changes,
+            "age": p.get('Age'),
+            "games": p.get('G'),
+            "mpg": p.get('MPG', 0.0),
+            "base_score": p.get('base_score', 0.0),
+            "vol_multiplier": p.get('vol_multiplier', 1.0),
+            "on_off_multiplier": p.get('on_off_multiplier', 1.0),
+            "on_off_raw": p.get('on_off_raw', 0.0),
+        })
+    return jsonify(players)
+
+
+@app.route('/api/my-team', methods=['GET'])
+def get_my_team():
+    """Returns your team, roster, position counts and current synergy breakdown."""
+    roster = DRAFT_STATE["teams"].get(DRAFT_STATE["user_team"], [])
+    filled = {pos: sum(1 for p in roster if p['position'] == pos) for pos in ROSTER_SLOTS}
+    synergy, breakdown = calculate_roster_synergy(roster, return_breakdown=True)
+    return jsonify({
+        "team": DRAFT_STATE["user_team"],
+        "filled": filled,
+        "slots": ROSTER_SLOTS,
+        "roster": [{"name": p['name'], "position": p['position'], "overall_rank": round(p['overall_rank'], 1),
+                    "tags": player_tags(p)} for p in roster],
+        "talent": round(sum(p['overall_rank'] for p in roster), 1),
+        "synergy": synergy,
+        "synergy_breakdown": breakdown,
+    })
 
 
 @app.route('/api/make-user-pick', methods=['POST'])
@@ -96,8 +182,15 @@ def make_user_pick():
     player_name = data.get('player_name')
 
     # Search for the player in the available pool
+    user_roster = DRAFT_STATE["teams"][DRAFT_STATE["user_team"]]
+
     for i, player in enumerate(DRAFT_STATE["available_players"]):
         if player['name'] == player_name:
+            if player['position'] not in open_positions(user_roster):
+                limit = ROSTER_SLOTS.get(player['position'], 0)
+                return jsonify({"status": "error",
+                                "message": f"Your {player['position']} spots are full ({limit}/{limit})"}), 400
+
             drafted_player = DRAFT_STATE["available_players"].pop(i)
             team_name = DRAFT_STATE["user_team"]
 
@@ -146,16 +239,22 @@ def get_standings():
 
     team_evaluations = []
     for name, roster in DRAFT_STATE["teams"].items():
-        avg_talent = sum(p['overall_rank'] for p in roster) / len(roster) if roster else 0
+        total_talent = sum(p['overall_rank'] for p in roster)
+        avg_talent = total_talent / len(roster) if roster else 0
 
         # Get score AND breakdown from draft_engine
         synergy, breakdown = calculate_roster_synergy(roster, return_breakdown=True)
-        final_team_score = avg_talent + synergy
+        weighted_synergy = synergy * SYNERGY_WEIGHT
+        final_team_score = total_talent + weighted_synergy
 
         team_evaluations.append({
             "team": name,
+            "is_user": name == DRAFT_STATE["user_team"],
+            "talent": round(total_talent, 1),
             "avg_talent": round(avg_talent, 1),
             "synergy": round(synergy, 1),
+            "weighted_synergy": round(weighted_synergy, 1),
+            "synergy_weight": SYNERGY_WEIGHT,
             "total_score": round(final_team_score, 1),
             "roster": roster,
             "synergy_breakdown": breakdown

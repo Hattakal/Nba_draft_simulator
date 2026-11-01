@@ -53,7 +53,7 @@ def clean_and_normalize_df(df, suffix="", is_primary=False):
     df = df.drop_duplicates(subset=['Player'], keep='first')
 
     # 4. Handle clashing metadata columns
-    metadata_cols = ['Age', 'Tm', 'G', 'MP', 'Pos']
+    metadata_cols = ['Age', 'Team', 'Tm', 'G', 'MP', 'Pos']
 
     if not is_primary:
         # For supplementary tables, drop these columns entirely so they don't clash
@@ -184,7 +184,7 @@ def build_ultimate_2026_database():
     master_df = master_df.fillna(0)
 
     # Safely convert all columns to numeric except name, position, and team
-    non_numeric = ['Player', 'Pos', 'Tm']
+    non_numeric = ['Player', 'Pos', 'Team', 'Tm']
     for col in master_df.columns:
         if col not in non_numeric:
             column_series = master_df[col]
